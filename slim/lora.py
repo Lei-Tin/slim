@@ -4,6 +4,16 @@ import tqdm.auto as tqdm
 from .utils import prune_nm, get_layers_list, find_layers
 from typing import Optional, Dict, Any
 import math
+import multiprocessing
+import numpy as np
+
+
+def sqrtm_scipy(A: np.ndarray):
+    if not isinstance(A, np.ndarray):
+        raise RuntimeError("input matrix must be a numpy array")
+    import scipy.linalg as spla
+    A_sqrt, errest = spla.sqrtm(A, disp=False)
+    return dict(A_sqrt=A_sqrt, errest=errest)
 
 
 def prune_and_optimize_lora(
@@ -154,7 +164,7 @@ class ScaleHookFactoryDiagonal:
         return scale_hook
 
     @torch.no_grad()
-    def get_scale_dict(self, progress_bar=False, scale_sharing_map=None) -> dict[str, torch.Tensor]:
+    def get_scale_dict(self, progress_bar=False) -> dict[str, torch.Tensor]:
         scale_names_prog_bar = tqdm.tqdm(
             self.scales, desc="Computing scale", disable=not progress_bar, total=len(self.scales)
         )
@@ -173,15 +183,6 @@ class ScaleHookFactoryDiagonal:
                     self.scales[name] = scale.cpu()
                 else:
                     self.scales[name] = scale
-
-        # Apply scale sharing if provided
-        if scale_sharing_map:
-            for target_layer, layers_sharing_scale in scale_sharing_map.items():
-                if target_layer in self.scales and self.scales[target_layer] is not None:
-                    target_scale = self.scales[target_layer]
-                    for shared_layer in layers_sharing_scale:
-                        if shared_layer in self.scales:
-                            self.scales[shared_layer] = target_scale.clone()
 
         return self.scales
     
@@ -262,9 +263,66 @@ class ScaleHookFactoryRxx:
         return scale_hook
 
     @torch.no_grad()
-    def get_scale_dict(self, progress_bar=False, sqrtm_implementation: str = "scipy", sqrtm_num_iters: int = 200, scale_sharing_map=None) -> dict[str, torch.Tensor]:
+    def get_scale_dict(self, progress_bar=False, sqrtm_implementation: str = "scipy", sqrtm_num_iters: int = 200) -> dict[str, torch.Tensor]:
+        if sqrtm_implementation == "scipy":
+            # Use multiprocessing for scipy implementation to speed up computation
+            return self._get_scale_dict_scipy_multiprocessing(progress_bar)
+        else:
+            # Use iterative method (single-threaded, GPU-accelerated)
+            return self._get_scale_dict_iterative(progress_bar, sqrtm_num_iters)
+    
+    def _get_scale_dict_scipy_multiprocessing(self, progress_bar=False) -> dict[str, torch.Tensor]:
+        """Compute scales using scipy with multiprocessing for speed."""
+        # convert to numpy
+        for name in self.scales:
+            if self.scales[name] is not None:
+                # Normalize by number of samples first
+                if self.store_on_cpu and self.scales[name].device.type == 'cpu':
+                    scale = self.scales[name]
+                else:
+                    scale = self.scales[name].cpu()
+                scale = scale / self.n_samples[name]
+                self.scales[name] = scale.numpy()
+        
+        num_cores = multiprocessing.cpu_count()
+        num_processes = max(1, num_cores // 64)
+
+        with multiprocessing.Pool(num_processes) as pool:
+            with tqdm.tqdm(
+                total=len(self.scales), desc="Computing scale", disable=not progress_bar
+            ) as pbar:
+                for name, scale_and_err in zip(
+                    self.scales.keys(), pool.imap(sqrtm_scipy, self.scales.values())
+                ):
+                    if self.scales[name] is not None:
+                        scale = scale_and_err["A_sqrt"]
+                        self.scales[name] = scale
+                    pbar.update()
+
+        # convert to torch tensor
+        for name in self.scales:
+            if self.scales[name] is not None:
+                scale = self.scales[name]
+                n_samples = self.n_samples[name]
+                scale = (
+                    torch.from_numpy(scale)
+                    .to(torch.float32)
+                    .to(self.compute_devices[name])
+                )
+                scale = scale * (1 / math.sqrt(n_samples))
+                
+                # Store final scale on CPU to save memory
+                if self.store_on_cpu:
+                    self.scales[name] = scale.cpu()
+                else:
+                    self.scales[name] = scale
+
+        return self.scales
+    
+    def _get_scale_dict_iterative(self, progress_bar=False, sqrtm_num_iters: int = 200) -> dict[str, torch.Tensor]:
+        """Compute scales using iterative Newton-Schulz method (single-threaded, GPU-accelerated)."""
         scale_names_prog_bar = tqdm.tqdm(
-            self.scales, desc="Computing RXX scale", disable=not progress_bar, total=len(self.scales)
+            self.scales, desc="Computing RXX scale (iterative)", disable=not progress_bar, total=len(self.scales)
         )
 
         for name in scale_names_prog_bar:
@@ -280,31 +338,15 @@ class ScaleHookFactoryRxx:
                 # Normalize by number of samples
                 scale = scale / self.n_samples[name]
                 
-                # Compute matrix square root
-                if sqrtm_implementation == "scipy":
-                    import scipy.linalg as spla
-                    scale_np = scale.cpu().numpy()
-                    scale_sqrt_np = spla.sqrtm(scale_np).real
-                    scale_sqrt = torch.from_numpy(scale_sqrt_np).to(device=compute_device, dtype=torch.float32)
-                else:
-                    # Use iterative Newton-Schulz method
-                    scale_sqrt = sqrtm_newton_schulz(scale.unsqueeze(0), numIters=sqrtm_num_iters).squeeze(0)
-                    scale_sqrt = scale_sqrt.to(torch.float32)
+                # Use iterative Newton-Schulz method
+                scale_sqrt = sqrtm_newton_schulz(scale.unsqueeze(0), numIters=sqrtm_num_iters).squeeze(0)
+                scale_sqrt = scale_sqrt.to(torch.float32)
                 
                 # Store final scale on CPU to save memory
                 if self.store_on_cpu:
                     self.scales[name] = scale_sqrt.cpu()
                 else:
                     self.scales[name] = scale_sqrt
-
-        # Apply scale sharing if provided
-        if scale_sharing_map:
-            for target_layer, layers_sharing_scale in scale_sharing_map.items():
-                if target_layer in self.scales and self.scales[target_layer] is not None:
-                    target_scale = self.scales[target_layer]
-                    for shared_layer in layers_sharing_scale:
-                        if shared_layer in self.scales:
-                            self.scales[shared_layer] = target_scale.clone()
 
         return self.scales
     
@@ -355,96 +397,6 @@ def get_layer_name(model, layer):
             return name
     return None
 
-
-# Global configuration for scale sharing by model type
-OPT_SCALE_SHARING_CONFIG = {
-    # For OPT models, k_proj shares scales with q_proj and v_proj
-    "scale_sharing_patterns": [
-        {
-            "target_layer_pattern": "self_attn.k_proj",
-            "shared_layers_patterns": ["self_attn.q_proj", "self_attn.v_proj"]
-        }
-    ]
-}
-
-# Model type configurations
-MODEL_SCALE_SHARING_CONFIGS = {
-    "opt": OPT_SCALE_SHARING_CONFIG,
-    # Add other model types here as needed
-}
-
-def create_scale_sharing_map(model, model_type=None):
-    """Create scale sharing map based on model type configuration"""
-    if model_type is None or model_type not in MODEL_SCALE_SHARING_CONFIGS:
-        return {}
-    
-    config = MODEL_SCALE_SHARING_CONFIGS[model_type]
-    scale_sharing_map = {}
-    
-    # Find all decoder layers
-    layers = get_layers_list(model)
-    
-    # Determine the correct layer prefix based on model structure
-    layer_prefix = "model.model.decoder.layers" if hasattr(model, 'model') and hasattr(model.model, 'decoder') else "model.layers"
-    
-    for i, layer in enumerate(layers):
-        subset = find_layers(layer)
-        
-        # Apply scale sharing patterns
-        for pattern in config["scale_sharing_patterns"]:
-            target_pattern = pattern["target_layer_pattern"]
-            shared_patterns = pattern["shared_layers_patterns"]
-            
-            # Check if target layer exists in this layer
-            if target_pattern in subset:
-                target_layer_name = f"{layer_prefix}.{i}.{target_pattern}"
-                shared_layer_names = []
-                
-                # Find all shared layers that exist
-                for shared_pattern in shared_patterns:
-                    if shared_pattern in subset:
-                        shared_layer_names.append(f"{layer_prefix}.{i}.{shared_pattern}")
-                
-                if shared_layer_names:
-                    scale_sharing_map[target_layer_name] = shared_layer_names
-    
-    return scale_sharing_map
-
-
-def register_qera_hooks_with_sharing(model, qera_hook_factory, model_type=None):
-    """Register QERA hooks with proper scale sharing based on model type"""
-    layers = get_layers_list(model)
-    layer_prefix = "model.model.decoder.layers" if hasattr(model, 'model') and hasattr(model.model, 'decoder') else "model.layers"
-    
-    # Create scale sharing map
-    scale_sharing_map = create_scale_sharing_map(model, model_type)
-    
-    # Get all target layers (layers that will actually collect data)
-    target_layers = set()
-    shared_layers = set()
-    
-    for target_layer, shared_list in scale_sharing_map.items():
-        target_layers.add(target_layer)
-        shared_layers.update(shared_list)
-    
-    # Register hooks for all layers
-    for i, layer in enumerate(layers):
-        subset = find_layers(layer)
-        
-        for name in subset:
-            full_name = f"{layer_prefix}.{i}.{name}"
-            
-            # Only register hook if this layer collects its own data
-            # (either it's not in shared_layers, or it's a target_layer)
-            if full_name not in shared_layers or full_name in target_layers:
-                hook = qera_hook_factory.get_scale_hook(full_name)
-                handle = subset[name].register_forward_hook(hook)
-                qera_hook_factory.handles.append(handle)
-            else:
-                # Initialize placeholder for shared layers
-                qera_hook_factory.scales[full_name] = None
-    
-    return scale_sharing_map
 
 def find_layers_to_register_scale_hook(model):
     """Find layers to register scale hooks for - simplified version for SLiM"""

@@ -18,7 +18,7 @@ CSV_COLUMNS = ["model", "prune_method", "sparsity_ratio", "sparsity_type", "lora
                "slim_lora", "shift_zero_metrics", "prune_lora", "quantize_lora", "lora_tile_size", "eval_dataset",
                "quantize_weight", "bitwidth", "tiled_weight_quantization", "weight_tile_size", "quantize_input",
                "input_bitwidth", "input_group_size", "fine_tune", "optimizer", "slim_quant", "use_qera", "qera_mode",
-               "perplexity", "mmlu", "piqa", "arc_easy", "arc_challenge", "winogrande", "openbookqa", "average"]
+               "qera_sqrtm_implementation", "perplexity", "mmlu", "piqa", "arc_easy", "arc_challenge", "winogrande", "openbookqa", "average"]
 
 
 def add_result_to_csv(args, ppl, lmharness_results):
@@ -113,6 +113,8 @@ def main():
                         help="Use QERA algorithm for LoRA decomposition")
     parser.add_argument("--qera_mode", type=str, default="diag", choices=["diag", "rxx"],
                         help="QERA scaling mode: 'diag' for diagonal (approximate) or 'rxx' for exact")
+    parser.add_argument("--qera_sqrtm_implementation", type=str, default="scipy", choices=["scipy", "iterative"],
+                        help="Implementation for matrix square root computation when using rxx mode")
     parser.add_argument("--model_type", type=str, default=None, choices=["opt", "llama", "mistral"],
                         help="Model type for QERA scale sharing configuration (auto-detected if not specified)")
 
@@ -169,6 +171,7 @@ def main():
         mask_checkpoint=args.maskllm_checkpoint,
         use_qera=args.use_qera,
         qera_mode=args.qera_mode,
+        qera_sqrtm_implementation=args.qera_sqrtm_implementation,
         model_type=args.model_type,
     )
     report_gpu_memory("After pruning")

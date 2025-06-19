@@ -162,6 +162,7 @@ def prune_wanda(
         scale_important_weights=False,
         use_qera=False,
         qera_mode="diag",
+        qera_sqrtm_implementation="scipy",
         model_type=None,
 ):
     """
@@ -225,7 +226,6 @@ def prune_wanda(
     # Initialize QERA scale collection if using QERA with CPU storage for memory efficiency
     qera_hook_factory = None
     qera_scale_dict = None
-    scale_sharing_map = None
     
     if use_qera:
         if qera_mode in ["diagonal", "diag"]:
@@ -239,15 +239,24 @@ def prune_wanda(
         else:
             raise ValueError(f"Unknown QERA mode: {qera_mode}")
         
-        # Auto-detect model type if not specified
-        if model_type is None:
-            model_type = model.config.model_type if hasattr(model.config, 'model_type') else 'unknown'
+        print(f"Registering QERA hooks for all layers individually (no scale sharing)...")
         
-        print(f"Registering QERA hooks for {model_type} model with proper scale sharing and CPU storage...")
+        # Register hooks for all linear layers individually (no scale sharing)
+        from .lora import find_layers_to_register_scale_hook
+        layers_to_register = find_layers_to_register_scale_hook(model)
         
-        # Use the simplified global configuration approach
-        from .lora import register_qera_hooks_with_sharing
-        scale_sharing_map = register_qera_hooks_with_sharing(model, qera_hook_factory, model_type)
+        for layer_info in layers_to_register:
+            layer_name = layer_info["target_layer"]
+            # Get the actual layer from the model
+            target_layer = None
+            for name, module in model.named_modules():
+                if name == layer_name and isinstance(module, torch.nn.Linear):
+                    target_layer = module
+                    break
+            
+            if target_layer is not None:
+                handle = target_layer.register_forward_hook(qera_hook_factory.get_scale_hook(layer_name))
+                qera_hook_factory.handles.append(handle)
         
         # Run calibration through the entire model to collect QERA scales
         print("Running QERA calibration through entire model (scales stored on CPU)...")
@@ -258,14 +267,19 @@ def prune_wanda(
         model = model.cpu()
         torch.cuda.empty_cache()  # Free GPU memory after calibration
         
-        # Compute QERA scales once for all layers with scale sharing (final scales stored on CPU)
+        # Compute QERA scales for all layers individually (no scale sharing)
         print("Computing QERA scales (stored on CPU)...")
-        qera_scale_dict = qera_hook_factory.get_scale_dict(progress_bar=False, scale_sharing_map=scale_sharing_map)
+        if qera_mode == "rxx":
+            qera_scale_dict = qera_hook_factory.get_scale_dict(
+                progress_bar=False, 
+                sqrtm_implementation=qera_sqrtm_implementation
+            )
+        else:
+            qera_scale_dict = qera_hook_factory.get_scale_dict(progress_bar=False)
         qera_hook_factory.remove_all_hooks()
         print(f"Computed QERA scales for {len(qera_scale_dict)} layers (stored on CPU for memory efficiency)")
         
         # Clean up calibration data and QERA factory to free memory
-        del scale_sharing_map
         del qera_hook_factory
         import gc
         gc.collect()
@@ -639,6 +653,7 @@ def joint_pq(
         scale_important_weights=False,
         use_qera=False,
         qera_mode="diag",
+        qera_sqrtm_implementation="scipy",
         model_type=None,
 ):
     """
@@ -909,6 +924,7 @@ def prune_and_quantize(
         mask_checkpoint=None,
         use_qera=False,
         qera_mode="diag",
+        qera_sqrtm_implementation="scipy",
         model_type=None,
 ):
     """
@@ -941,6 +957,7 @@ def prune_and_quantize(
         mask_checkpoint: str - Path to a checkpoint containing masks
         use_qera: bool - Whether to use QERA's L and R matrices
         qera_mode: str - The mode for QERA scaling ("diag" or "rxx")
+        qera_sqrtm_implementation: str - The implementation for matrix square root computation ("scipy" or "iterative")
         model_type: str - The type of the model
     """
     if sparsity_type != "unstructured":
@@ -974,6 +991,7 @@ def prune_and_quantize(
             scale_important_weights=scale_important_weights,
             use_qera=use_qera,
             qera_mode=qera_mode,
+            qera_sqrtm_implementation=qera_sqrtm_implementation,
             model_type=model_type,
         )
     elif prune_method == "magnitude":
@@ -1027,6 +1045,7 @@ def prune_and_quantize(
             scale_important_weights=scale_important_weights,
             use_qera=use_qera,
             qera_mode=qera_mode,
+            qera_sqrtm_implementation=qera_sqrtm_implementation,
             model_type=model_type,
         )
     else:
