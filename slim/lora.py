@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from slim.quantization.quantization import Quantizer as AutoQuantizer
 import tqdm.auto as tqdm
 from .utils import prune_nm, get_layers_list, find_layers
@@ -6,6 +7,41 @@ from typing import Optional, Dict, Any
 import math
 import multiprocessing
 import numpy as np
+import logging
+import pandas as pd
+import os
+
+# Configure logging for calibration errors
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Global list to collect calibration errors during pipeline execution
+CALIBRATION_ERRORS = []
+
+
+def save_calibration_errors_to_csv(calibration_errors, csv_path):
+    """
+    Save calibration errors to CSV file
+    
+    Args:
+        calibration_errors: List of calibration error dictionaries
+        csv_path: Path to save CSV file
+    """
+    if not calibration_errors:
+        logger.warning("No calibration errors to save")
+        return
+    
+    # Create directory if it doesn't exist
+    os.makedirs(os.path.dirname(csv_path) if os.path.dirname(csv_path) else '.', exist_ok=True)
+    
+    # Convert to DataFrame and save
+    df = pd.DataFrame(calibration_errors)
+    df.to_csv(csv_path, index=False)
+    
+    # Log summary
+    logger.info(f"Saved {len(calibration_errors)} calibration error measurements to {csv_path}")
+    logger.info(f"Overall mean relative error: {df['mean_relative_error'].mean():.6f}")
+    logger.info(f"Overall max relative error: {df['mean_relative_error'].max():.6f}")
 
 
 def sqrtm_scipy(A: np.ndarray):
@@ -459,7 +495,10 @@ def add_lora(
         scale_important_weights=False,
         use_qera=False,
         qera_mode="diag",
-        qera_scale_dict=None
+        qera_scale_dict=None,
+        calibration_inputs=None,
+        log_calibration_error=False,
+        layer_name=""
 ):
     """
     Add low-rank adapters to compensate for the compression loss.
@@ -477,6 +516,9 @@ def add_lora(
         use_qera: bool, Whether to use QERA's L and R matrices
         qera_mode: str, The mode for QERA scaling ("diag" or "rxx")
         qera_scale_dict: Dict[str, torch.Tensor], Dictionary of scales from QERA
+        calibration_inputs: List[torch.Tensor], Input tensors for calibration error computation
+        log_calibration_error: bool, Whether to compute and log calibration error
+        layer_name: str, Name of the layer for logging purposes
     """
     
     if scale_important_weights:
@@ -587,6 +629,48 @@ def add_lora(
         low_rank_weight = lora_right.t() @ lora_left.t()
         module.weight.data = (compressed_weight + low_rank_weight).to(torch.bfloat16)
 
+    # Compute and log calibration error if requested
+    if log_calibration_error and calibration_inputs is not None:
+        calibration_error_stats = compute_calibration_error(
+            module=module,
+            original_weight=original_weight,
+            compressed_weight=compressed_weight.to(torch.bfloat16),
+            lora_left=lora_left.to(torch.bfloat16),
+            lora_right=lora_right.to(torch.bfloat16),
+            calibration_inputs=calibration_inputs,
+            layer_name=layer_name or "unknown",
+            separate_lora=separate_lora
+        )
+        # Store calibration error stats in the module for later access
+        module.calibration_error_stats = calibration_error_stats
+        
+        # Add to global list for CSV export
+        if calibration_error_stats:
+            CALIBRATION_ERRORS.append(calibration_error_stats)
+        
+        return calibration_error_stats
+    
+    return None
+
+
+def clear_calibration_errors():
+    """Clear the global calibration errors list"""
+    global CALIBRATION_ERRORS
+    CALIBRATION_ERRORS = []
+
+
+def get_calibration_errors():
+    """Get the current calibration errors"""
+    return CALIBRATION_ERRORS.copy()
+
+
+def export_calibration_errors_to_csv(csv_path):
+    """Export accumulated calibration errors to CSV"""
+    if CALIBRATION_ERRORS:
+        save_calibration_errors_to_csv(CALIBRATION_ERRORS, csv_path)
+    else:
+        logger.warning("No calibration errors to export")
+
 
 def compute_qera_lora(original_weight, compressed_weight, qera_scales, rank_ratio):
     """
@@ -681,3 +765,89 @@ def _low_rank_decomposition_qera(x: torch.Tensor, reduced_rank: int):
     L = U @ torch.diag(S)[:, :reduced_rank]
     R = Vh[:reduced_rank, :]
     return L, R
+
+
+def compute_calibration_error(module, original_weight, compressed_weight, lora_left, lora_right, 
+                            calibration_inputs, layer_name="", separate_lora=True):
+    """
+    Compute calibration error: output difference between original weights and compressed weights + LoRA
+    
+    Args:
+        module: The linear module
+        original_weight: Original uncompressed weight matrix [out_dim, in_dim]
+        compressed_weight: Compressed (pruned/quantized) weight matrix [out_dim, in_dim]
+        lora_left: Left LoRA matrix [in_dim, rank]
+        lora_right: Right LoRA matrix [rank, out_dim] 
+        calibration_inputs: List of input tensors to use for calibration [batch_size, ..., in_dim]
+        layer_name: Name of the layer for logging
+        separate_lora: Whether LoRA is stored separately or merged
+        
+    Returns:
+        dict: Dictionary containing error metrics
+    """
+    if calibration_inputs is None or len(calibration_inputs) == 0:
+        logger.warning(f"No calibration inputs provided for layer {layer_name}")
+        return {}
+    
+    device = original_weight.device
+    dtype = original_weight.dtype
+    
+    # Convert inputs to tensors if needed and move to device
+    if not isinstance(calibration_inputs, list):
+        calibration_inputs = [calibration_inputs]
+    
+    errors = []
+    relative_errors = []
+    
+    with torch.no_grad():
+        for i, input_tensor in enumerate(calibration_inputs):
+            # Ensure input is on correct device and reshape for matrix multiplication
+            input_tensor = input_tensor.to(device=device, dtype=dtype)
+            original_shape = input_tensor.shape
+            
+            # Original output
+            original_output = F.linear(input_tensor, original_weight, None) 
+            
+            # Compressed + LoRA output
+            if separate_lora:
+
+                compressed_output = F.linear(input_tensor, compressed_weight, None)
+
+                lora_intermediate = F.linear(input_tensor, lora_left.t(), None)
+                lora_output = F.linear(lora_intermediate, lora_right.t(), None)
+                combined_output = compressed_output + lora_output
+            else:
+                # Merged case: LoRA already added to compressed_weight
+                combined_output = F.linear(input_tensor, compressed_weight.t(), None)
+            
+            # Compute error metrics
+            error = torch.norm(original_output - combined_output, p='fro')
+            original_norm = torch.norm(original_output, p='fro')
+            
+            if original_norm > 0:
+                relative_error = error / original_norm
+            else:
+                relative_error = error
+                
+            errors.append(error.item())
+            relative_errors.append(relative_error.item())
+    
+    # Compute statistics
+    mean_error = np.mean(errors)
+    max_error = np.max(errors)
+    mean_relative_error = np.mean(relative_errors)
+    max_relative_error = np.max(relative_errors)
+    
+    # Log the results
+    logger.info(f"Calibration Error for {layer_name}: Mean Rel Error: {mean_relative_error:.6f}")
+    
+    return {
+        'layer_name': layer_name,
+        'mean_absolute_error': mean_error,
+        'max_absolute_error': max_error,
+        'mean_relative_error': mean_relative_error,
+        'max_relative_error': max_relative_error,
+        'num_calibration_samples': len(calibration_inputs)
+    }
+
+

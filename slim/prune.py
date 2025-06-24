@@ -5,7 +5,7 @@ from .sparsegpt import Quantizer as SparseGPTQuantizer
 from .layerwrapper import WrappedGPT
 from .data import get_loaders
 from .utils import get_layers_list, shift_zeros, find_layers, prune_nm
-from .lora import add_lora, register_scale_hooks
+from .lora import add_lora, register_scale_hooks, compute_calibration_error, CALIBRATION_ERRORS
 from slim.quantization.quantization import Quantizer as AutoQuantizer, QuantizedMatmul
 import tqdm.auto as tqdm
 from .jsq_utils import clip_matrix, generate_ss
@@ -164,6 +164,8 @@ def prune_wanda(
         qera_mode="diag",
         qera_sqrtm_implementation="scipy",
         model_type=None,
+        log_calibration_error=False,
+        calibration_error_samples=10,
 ):
     """
     Prune a model using WANDA and quantize weights using SLiM-Quant or AbsMax and add low-rank adapter using SLiM or SVD.
@@ -194,6 +196,7 @@ def prune_wanda(
         scale_important_weights: bool - Whether to scale important weights
         use_qera: bool - Whether to use QERA's L and R matrices
         qera_mode: str - The mode for QERA scaling ("diag" or "rxx")
+        qera_sqrtm_implementation: str - The implementation for matrix square root computation ("scipy" or "iterative")
         model_type: str - The type of the model
     """
     use_cache = model.config.use_cache
@@ -222,6 +225,14 @@ def prune_wanda(
         quantizer = None
 
     layers = get_layers_list(model)
+
+    # Capture module inputs for calibration error computation if requested
+    module_inputs_for_calibration = {}
+    if log_calibration_error:
+        print("Capturing module inputs for calibration error computation...")
+        module_inputs_for_calibration = capture_module_inputs_for_calibration(
+            model, dataloader, nsamples, calibration_error_samples
+        )
 
     # Initialize QERA scale collection if using QERA with CPU storage for memory efficiency
     qera_hook_factory = None
@@ -349,6 +360,19 @@ def prune_wanda(
                 else:
                     setattr(subset[name], '_module_name', full_name)
                 
+                # Prepare calibration inputs for this module if logging is enabled
+                layer_calibration_inputs = None
+                if log_calibration_error:
+                    # Use the captured module inputs for this specific module
+                    if full_name in module_inputs_for_calibration:
+                        layer_calibration_inputs = module_inputs_for_calibration[full_name]
+                    else:
+                        # Fallback: use a subset of layer inputs (should rarely happen)
+                        layer_calibration_inputs = []
+                        for j in range(min(nsamples, calibration_error_samples)):
+                            layer_calibration_inputs.append(inps[j])
+                        print(f"Warning: No captured inputs found for {full_name}, using layer inputs as fallback")
+                
                 add_lora(subset[name],
                          W_mask=W_mask,
                          rank_ratio=lora_rank,
@@ -362,7 +386,10 @@ def prune_wanda(
                          scale_important_weights=scale_important_weights,
                          use_qera=use_qera,
                          qera_mode=qera_mode,
-                         qera_scale_dict=qera_scale_dict
+                         qera_scale_dict=qera_scale_dict,
+                         calibration_inputs=layer_calibration_inputs,
+                         log_calibration_error=log_calibration_error,
+                         layer_name=full_name
                          )
 
                 if quantizer is not None:
@@ -655,6 +682,8 @@ def joint_pq(
         qera_mode="diag",
         qera_sqrtm_implementation="scipy",
         model_type=None,
+        log_calibration_error=False,
+        calibration_error_samples=10,
 ):
     """
     Prune and quantize a model using joint pruning and quantization.
@@ -707,6 +736,14 @@ def joint_pq(
     )
 
     layers = get_layers_list(model)
+
+    # Capture module inputs for calibration error computation if requested
+    module_inputs_for_calibration = {}
+    if log_calibration_error:
+        print("Capturing module inputs for calibration error computation...")
+        module_inputs_for_calibration = capture_module_inputs_for_calibration(
+            model, dataloader, nsamples, calibration_error_samples
+        )
 
     # Auto-detect model type if not specified
     if model_type is None:
@@ -800,6 +837,19 @@ def joint_pq(
                 else:
                     setattr(subset[name], '_module_name', full_name)
                 
+                # Prepare calibration inputs for this module if logging is enabled
+                layer_calibration_inputs = None
+                if log_calibration_error:
+                    # Use the captured module inputs for this specific module
+                    if full_name in module_inputs_for_calibration:
+                        layer_calibration_inputs = module_inputs_for_calibration[full_name]
+                    else:
+                        # Fallback: use a subset of layer inputs (should rarely happen)
+                        layer_calibration_inputs = []
+                        for j in range(min(nsamples, calibration_error_samples)):
+                            layer_calibration_inputs.append(inps[j])
+                        print(f"Warning: No captured inputs found for {full_name}, using layer inputs as fallback")
+                
                 add_lora(subset[name],
                          W_mask=W_mask,
                          rank_ratio=lora_rank,
@@ -813,7 +863,10 @@ def joint_pq(
                          scale_important_weights=scale_important_weights,
                          use_qera=use_qera,
                          qera_mode=qera_mode,
-                         qera_scale_dict=scale_sharing_map
+                         qera_scale_dict=scale_sharing_map,
+                         calibration_inputs=layer_calibration_inputs,
+                         log_calibration_error=log_calibration_error,
+                         layer_name=full_name
                          )
 
                 if quantizer is not None:
@@ -926,6 +979,8 @@ def prune_and_quantize(
         qera_mode="diag",
         qera_sqrtm_implementation="scipy",
         model_type=None,
+        log_calibration_error=False,
+        calibration_error_samples=10,
 ):
     """
     Prune and quantize a model using various methods.
@@ -993,6 +1048,8 @@ def prune_and_quantize(
             qera_mode=qera_mode,
             qera_sqrtm_implementation=qera_sqrtm_implementation,
             model_type=model_type,
+            log_calibration_error=log_calibration_error,
+            calibration_error_samples=calibration_error_samples,
         )
     elif prune_method == "magnitude":
         prune_magnitude(
@@ -1047,6 +1104,78 @@ def prune_and_quantize(
             qera_mode=qera_mode,
             qera_sqrtm_implementation=qera_sqrtm_implementation,
             model_type=model_type,
+            log_calibration_error=log_calibration_error,
+            calibration_error_samples=calibration_error_samples,
         )
     else:
         raise ValueError(f"Invalid prune method: {prune_method}")
+
+
+def capture_module_inputs_for_calibration(
+        model,
+        dataloader,
+        nsamples=128,
+        max_calibration_samples=10
+):
+    """
+    Capture inputs to individual linear modules during calibration forward pass.
+    This captures the actual inputs that each linear module receives during the forward pass.
+    
+    Args:
+        model: torch.nn.Module - The model
+        dataloader: torch.utils.data.DataLoader - The dataloader
+        nsamples: int - Number of samples to use for calibration
+        max_calibration_samples: int - Maximum number of samples to store for calibration error computation
+        
+    Returns:
+        Dict[str, List[torch.Tensor]] - Dictionary mapping module names to lists of input tensors
+    """
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    
+    # Dictionary to store inputs for each module
+    module_inputs = {}
+    module_handles = []
+    
+    def create_input_capture_hook(module_name):
+        def hook(module, input, output):
+            if module_name not in module_inputs:
+                module_inputs[module_name] = []
+            
+            # Only store up to max_calibration_samples to save memory
+            if len(module_inputs[module_name]) < max_calibration_samples:
+                # Store the input tensor on CPU to save GPU memory
+                input_tensor = input[0].detach().cpu()
+                module_inputs[module_name].append(input_tensor)
+        return hook
+    
+    # Register hooks on all linear modules
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            # Skip embedding and output layers
+            if any(skip in name.lower() for skip in ['embed', 'lm_head', 'head']):
+                continue
+            handle = module.register_forward_hook(create_input_capture_hook(name))
+            module_handles.append(handle)
+    
+    # Run forward pass to capture inputs
+    model = model.cuda()
+    sample_count = 0
+    for batch in dataloader:
+        if sample_count >= nsamples:
+            break
+        with torch.no_grad():
+            _ = model(batch[0].cuda())
+        sample_count += batch[0].shape[0]
+    
+    # Remove all hooks
+    for handle in module_handles:
+        handle.remove()
+    
+    model.config.use_cache = use_cache
+    model = model.cpu()
+    torch.cuda.empty_cache()
+    
+    print(f"Captured inputs for {len(module_inputs)} modules with up to {max_calibration_samples} samples each")
+    
+    return module_inputs

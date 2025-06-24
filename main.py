@@ -90,6 +90,12 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=1)
     parser.add_argument("--output_csv_path", type=str, default=None,
                         help='Output CSV to accumulate experiment result')
+    parser.add_argument("--calibration_error_csv", type=str, default=None,
+                        help='Output CSV path for calibration error logging')
+    parser.add_argument("--log_calibration_error", action="store_true",
+                        help="Whether to log calibration errors during LoRA addition")
+    parser.add_argument("--calibration_error_samples", type=int, default=10,
+                        help="Number of samples to use for calibration error computation")
     parser.add_argument('--test_lmharness', action="store_true", help="Whether to test LMEHarness tasks")
     parser.add_argument('--fine_tune', action="store_true",
                         help="Whether to fine-tune the model after pruning")
@@ -144,6 +150,11 @@ def main():
 
     report_gpu_memory("Before Pruning")
 
+    # Clear calibration errors if logging is enabled
+    if args.log_calibration_error:
+        from slim.lora import clear_calibration_errors
+        clear_calibration_errors()
+
     prune_and_quantize(
         model,
         tokenizer,
@@ -173,10 +184,17 @@ def main():
         qera_mode=args.qera_mode,
         qera_sqrtm_implementation=args.qera_sqrtm_implementation,
         model_type=args.model_type,
+        log_calibration_error=args.log_calibration_error,
+        calibration_error_samples=args.calibration_error_samples,
     )
     report_gpu_memory("After pruning")
 
     model = distribute_model(model)
+    
+    # Export calibration errors if requested
+    if args.calibration_error_csv and args.log_calibration_error:
+        from slim.lora import export_calibration_errors_to_csv
+        export_calibration_errors_to_csv(args.calibration_error_csv)
 
     
     print("*" * 30)
